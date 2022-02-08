@@ -1,0 +1,408 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+
+Transform: AWS::Serverless-2016-10-31
+
+
+Description: "Builds the AWS Resources to take an Asana Task,
+convert it into a markdown document, write the markdown to a pdf
+and then save the pdf file back to the Asana task."
+
+
+Parameters:
+  ParamProjectId:
+    Description: Asana Project Id
+    Type: String
+  ParamWorkspaceId:
+    Description: Asana Workspace Id
+    Type: String
+  ParamWebhookCreateInterval:
+    Description: "Frequency of running Create Webhook function (in hours),
+    which deletes and recreates the webhook."
+    Type: Number
+    Default: 24
+  ParamApiRate:
+    Description: API Gateway rate limit
+    Type: Number
+    Default: 1
+  ParamApiBurst:
+    Description: API Gateway burst limit
+    Type: Number
+    Default: 1
+  ParamObjectRetain:
+    Description: "Number of days to retain objects in the S3 Bucket. Used in S3
+    bucket life-cycle policy. Any current version of an object will expire after
+    this number of days to become non current. Any non current version of the
+    object will then be permanently deleted after this number of days."
+    Type: Number
+    Default: 7
+
+
+Resources:
+  SSMParameterAPIURL:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/APIURL
+      Type: String
+      Value: !Sub https://${ServerlessApiWebhooks}.execute-api.${AWS::Region}.amazonaws.com/default/webhook-receive
+  SSMParameterS3BucketDocStore:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/S3BucketDocStore
+      Type: String
+      Value: !Join ["-",["asana-aws-taskdoc-s3bucketdocstore", !Select [6,!Split ["-",!Ref "AWS::StackId"]]]]
+  SSMParameterWorkspaceId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/WorkspaceId
+      Type: String
+      Value: !Ref ParamWorkspaceId
+  SSMParameterProjectId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${AWS::StackName}/ProjectId
+      Type: String
+      Value: !Ref ParamProjectId
+  SSMPArameterSQSQueueTask:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: !Sub /${AWS::StackName}/SQSQueueTask
+        Type: String
+        Value: !Ref SQSQueueTask
+  ServerlessFunctionAsanaTaskToMarkdown:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: functions/AsanaTaskToMarkdown/.
+      Description: "Convert Asana Task to a Task Schedule in Markdown format"
+      Environment:
+        Variables:
+          ParameterPath: !Sub /${AWS::StackName}/
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            BatchSize: 1
+            Enabled: true
+            Queue: !GetAtt SQSQueueTask.Arn
+      Handler: AsanaTaskToMarkdown.lambda_handler
+      Layers:
+        - !Ref ServerlessLayerVersionAsana
+        - !Ref ServerlessLayerVersionHelper
+      MemorySize: 128
+      Policies:
+        - !Ref IAMManagedPolicyS3BucketDocStore
+        - !Ref IAMManagedPolicySSM
+        - AWSLambdaBasicExecutionRole
+      Runtime: python3.9
+      Timeout: 30
+  ServerlessFunctionMarkdownToHtml:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: functions/MarkdownToHtml/.
+      Description: "Convert Markdown document to an HTML file."
+      Environment:
+        Variables:
+          ParameterPath: !Sub /${AWS::StackName}/
+      Handler: "MarkdownToHtml.lambda_handler"
+      Layers:
+        - !Ref ServerlessLayerVersionMistletoe
+        - !Ref ServerlessLayerVersionHelper
+        - !Ref ServerlessLayerVersionAsana
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref S3BucketDocStore
+            Events: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  -
+                    Name: suffix
+                    Value: AsanaTask.md
+      MemorySize: 128
+      Policies:
+        - !Ref IAMManagedPolicyS3BucketDocStore
+        - !Ref IAMManagedPolicySSM
+        - AWSLambdaBasicExecutionRole
+      Runtime: python3.9
+      Timeout: 30
+  ServerlessFunctionHtmlToPdf:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: functions/HtmlToPdf/.
+      Description: "Convert HTML file to PDF Document."
+      Environment:
+        Variables:
+          FONTCONFIG_PATH: /opt/fonts
+          ParameterPath: !Sub /${AWS::StackName}/
+      Handler: "HtmlToPdf.lambda_handler"
+      Layers:
+        - !Ref ServerlessLayerVersionWkhtmltox
+        - !Ref ServerlessLayerVersionHelper
+        - !Ref ServerlessLayerVersionAsana
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref S3BucketDocStore
+            Events: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  -
+                    Name: suffix
+                    Value: AsanaTask.html
+      MemorySize: 128
+      Policies:
+        - !Ref IAMManagedPolicyS3BucketDocStore
+        - !Ref IAMManagedPolicySSM
+        - AWSLambdaBasicExecutionRole
+      Runtime: python3.9
+      Timeout: 30
+  ServerlessFunctionPdfUploadToAsanaTask:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: functions/PdfUploadToAsanaTask/.
+      Description: "Upload created PDF file back to the Asana Task"
+      Environment:
+        Variables:
+          ParameterPath: !Sub /${AWS::StackName}/
+      Handler: "PdfUploadToAsanaTask.lambda_handler"
+      Layers:
+        - !Ref ServerlessLayerVersionAsana
+        - !Ref ServerlessLayerVersionHelper
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref S3BucketDocStore
+            Events: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  -
+                    Name: suffix
+                    Value: AsanaTask.pdf
+      MemorySize: 128
+      Policies:
+        - !Ref IAMManagedPolicyS3BucketDocStore
+        - !Ref IAMManagedPolicySSM
+        - AWSLambdaBasicExecutionRole
+      Runtime: python3.9
+      Timeout: 30
+  ServerlessFunctionWebhookReceive:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: functions/WebhookReceive/.
+      Description: "Receive Webhook"
+      Handler: "WebhookReceive.lambda_handler"
+      Layers:
+        - !Ref ServerlessLayerVersionAsana
+        - !Ref ServerlessLayerVersionHelper
+      Environment:
+        Variables:
+          ParameterPath: !Sub /${AWS::StackName}/
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /webhook-receive
+            Method: POST
+            RestApiId: !Ref ServerlessApiWebhooks
+          RequestParameters:
+            - method.request.querystring.auth
+      MemorySize: 128
+      Policies:
+        - !Ref IAMManagedPolicySSM
+        - AWSLambdaBasicExecutionRole
+        - !Ref IAMManagedPolicySQSTaskSend
+      Runtime: python3.9
+      Timeout: 30
+  ServerlessFunctionWebhookCreate:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      CodeUri: functions/WebhookCreate/.
+      Description: "Create Webhook"
+      Handler: "WebhookCreate.lambda_handler"
+      Environment:
+        Variables:
+          ParameterPath: !Sub /${AWS::StackName}/
+      Events:
+        ScheduledEvent:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub 'rate(${ParamWebhookCreateInterval} hours)'
+        SSMParamAsanaToken:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+              - aws.ssm
+              detail-type:
+              - Parameter Store Change
+              detail:
+                name:
+                - !Sub "/${AWS::StackName}/AsanaToken"
+                operation:
+                - Update
+                - Create
+      Layers:
+        - !Ref ServerlessLayerVersionAsana
+        - !Ref ServerlessLayerVersionHelper
+      MemorySize: 128
+      Policies:
+        - !Ref IAMManagedPolicySSM
+        - AWSLambdaBasicExecutionRole
+      Runtime: python3.9
+      Timeout: 30
+  ServerlessLayerVersionWkhtmltox:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - x86_64
+      CompatibleRuntimes:
+        - python3.9
+      ContentUri: layers/wkhtmltox/.
+      Description: https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-4/wkhtmltox-0.12.6-4.amazonlinux2_lambda.zip
+      LayerName: wkhtmltox
+      LicenseInfo: https://github.com/wkhtmltopdf/wkhtmltopdf/blob/master/LICENSE
+      RetentionPolicy: Delete
+  ServerlessLayerVersionMistletoe:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - x86_64
+      CompatibleRuntimes:
+        - python3.9
+      ContentUri: layers/mistletoe/.
+      Description: https://github.com/miyuchina/mistletoe.git
+      LayerName: mistletoe
+      LicenseInfo: https://github.com/miyuchina/mistletoe/blob/master/LICENSE
+      RetentionPolicy: Delete
+  ServerlessLayerVersionAsana:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - x86_64
+      CompatibleRuntimes:
+        - python3.9
+      ContentUri: layers/asana/.
+      Description: https://github.com/Asana/python-asana.git
+      LayerName: asana
+      LicenseInfo: https://github.com/Asana/python-asana/blob/master/LICENSE
+      RetentionPolicy: Delete
+  ServerlessLayerVersionHelper:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - x86_64
+      CompatibleRuntimes:
+        - python3.9
+      ContentUri: layers/helper/.
+      Description: Helper functions
+      LayerName: helper
+      RetentionPolicy: Delete
+  ServerlessApiWebhooks:
+    Type: AWS::Serverless::Api
+    Properties:
+      EndpointConfiguration:
+        Type: REGIONAL
+      StageName: default
+      MethodSettings:
+        - HttpMethod: '*'
+          LoggingLevel: INFO
+          MetricsEnabled: true
+          ResourcePath: '/*'
+          ThrottlingBurstLimit: !Ref ParamApiBurst
+          ThrottlingRateLimit: !Ref ParamApiRate
+  SQSQueueTask:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: "alias/aws/sqs"
+      MessageRetentionPeriod: 86400
+      ReceiveMessageWaitTimeSeconds: 0
+      VisibilityTimeout: 3600
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt IAMRoleApiGatewayAccount.Arn
+  IAMRoleApiGatewayAccount:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  S3BucketDocStore:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      BucketName: !Join ["-",["asana-aws-taskdoc-s3bucketdocstore", !Select [6,!Split ["-",!Ref "AWS::StackId"]]]]
+      LifecycleConfiguration:
+        Rules:
+          -
+            Status: Enabled
+            ExpirationInDays: !Ref ParamObjectRetain
+            Id: Remove after 30 days
+            NoncurrentVersionExpirationInDays: !Ref ParamObjectRetain
+      VersioningConfiguration:
+        Status: Enabled
+  IAMManagedPolicyS3BucketDocStore:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !Join ["",["arn:aws:s3:::asana-aws-taskdoc-s3bucketdocstore","-", !Select [6,!Split ["-",!Ref "AWS::StackId"]]]]
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Join ["",["arn:aws:s3:::asana-aws-taskdoc-s3bucketdocstore","-", !Select [6,!Split ["-",!Ref "AWS::StackId"]], "*"]]
+  IAMManagedPolicySQSTaskSend:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt SQSQueueTask.Arn
+  IAMManagedPolicySQSTaskReceive:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ReceiveMessage
+            Resource: !GetAtt SQSQueueTask.Arn
+  IAMManagedPolicySSM:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:PutParameter
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*
